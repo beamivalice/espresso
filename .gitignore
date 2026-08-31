@@ -1,0 +1,19 @@
+# Build
+app/build/
+app/Espresso.app
+*.log
+Logs/
+
+# Runtime: pinned engine, GPTK, Wine prefix (user machine)
+Engines/
+GPTK/
+Steam/
+
+# Wine dumps
+*.dmp
+
+# macOS
+.DS_Store
+
+# docs
+design-doc/
