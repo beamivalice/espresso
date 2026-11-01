@@ -82,7 +82,12 @@ final class Supervisor: ObservableObject {
     @Published var checks: [Check] = []
     @Published var doctorPassed = false
     @Published var doctorRan = false
-    @Published var status = "Idle"
+    /// Transient one-line message under the title. Empty means nothing to say.
+    @Published var status = ""
+    /// "Windows 11" / "Windows 10", as the prefix reports it.
+    @Published var windowsVersion = "Windows"
+    /// "Wine 10.0 r8 · GPTK 4.0b3" for the pinned engine and overlay.
+    @Published var runtimeVersions = ""
     /// Informational: DX12 test title installed in the prefix (not product scope).
     @Published var dx12TestPresent = false
     @Published var isLaunching = false
@@ -333,15 +338,14 @@ final class Supervisor: ObservableObject {
         // DX12 test title present (informational; does not block Steam)
         let present = fm.fileExists(atPath: L.dx12TestPOSIXPath())
         let passed = out.allSatisfy { $0.ok }
-        let okCount = out.filter { $0.ok }.count
 
         // Always called on the main actor, so publish directly.
         checks = out
         doctorPassed = passed
         doctorRan = true
         dx12TestPresent = present
-        status = passed ? "Doctor passed (\(okCount)/\(out.count))"
-                        : "Doctor FAILED (\(okCount)/\(out.count))"
+        windowsVersion = RuntimeInfo.windowsVersion(prefix: L.prefix)
+        runtimeVersions = RuntimeInfo.summary(engine: L.engine, external: L.external)
     }
 
     // MARK: Launch
@@ -591,6 +595,40 @@ final class Supervisor: ObservableObject {
         }
     }
 
+    /// True for the process names Wine gives its own processes: its binaries
+    /// (`wine`, `wine-preloader`, `wineserver`, ...) and, because Wine retitles every
+    /// Windows program to its Windows path, names such as `C:\\...\\steam.exe`.
+    static func isWineProcessName(_ comm: String) -> Bool {
+        if comm.range(of: #"^[A-Za-z]:\\"#, options: .regularExpression) != nil { return true }
+        return URL(fileURLWithPath: comm).lastPathComponent.hasPrefix("wine")
+    }
+
+    /// Wine processes that hold a file or directory under this prefix. Selected by
+    /// identity first (`isWineProcessName`), then attributed to the prefix by their
+    /// open files and cwd, so that unrelated processes are never returned.
+    func prefixWineProcessIDs() -> [pid_t] {
+        var candidates: [pid_t] = []
+        for line in shell("/bin/ps", ["-axo", "pid=,comm="]).out.split(separator: "\n") {
+            let f = line.trimmingCharacters(in: .whitespaces).split(separator: " ", maxSplits: 1)
+            if f.count == 2, let pid = pid_t(f[0]), Self.isWineProcessName(String(f[1])) {
+                candidates.append(pid)
+            }
+        }
+        guard !candidates.isEmpty else { return [] }
+        // `-F pn`: a "p<pid>" line, then one "n<path>" line per open file.
+        let out = shell("/usr/sbin/lsof",
+                        ["-a", "-p", candidates.map(String.init).joined(separator: ","), "-Fpn"]).out
+        var holders: [pid_t] = [], current: pid_t?
+        for line in out.split(separator: "\n") {
+            if line.hasPrefix("p") { current = pid_t(line.dropFirst()) }
+            else if line.hasPrefix("n"), let pid = current, !holders.contains(pid),
+                    line.dropFirst().hasPrefix(layout.prefix.path) {
+                holders.append(pid)
+            }
+        }
+        return holders
+    }
+
     /// Synchronous stop for use on quit; do not dispatch to main.
     func stopSync() {
         let p = Process()
@@ -600,13 +638,13 @@ final class Supervisor: ObservableObject {
         p.environment = wineEnvironment()
         try? p.run()
         p.waitUntilExit()
-        // Always sweep, but scope to Espresso's prefix/engine to avoid killing CrossOver if the user runs it.
-        // lsof +D on the prefix is the authority — pkill -f is broad, so filter by lsof first.
-        let holders = shell("/usr/sbin/lsof", ["+D", layout.prefix.path]).out
-        let hasHolders = holders.contains("wineserver") || holders.contains("steam") || holders.contains("winedevice")
-        if hasHolders || winePrefixBusy() {
+        // Always sweep, but only Wine processes that belong to *this* prefix, so a
+        // second Wine (CrossOver) and unrelated programs (a shell or Finder window
+        // that merely has the prefix as cwd) are never touched.
+        let holders = prefixWineProcessIDs()
+        if !holders.isEmpty || winePrefixBusy() {
+            for pid in holders { kill(pid, SIGKILL) }
             _ = shell("/bin/sh", ["-c",
-                "lsof +D '\(layout.prefix.path)' 2>/dev/null | awk 'NR>1{print $2}' | xargs -I {} kill -9 {} 2>/dev/null; " +
                 "pkill -9 -f '\(NSRegularExpression.escapedPattern(for: layout.wineserver.path))' 2>/dev/null; " +
                 "pkill -9 -f '\(NSRegularExpression.escapedPattern(for: layout.prefix.path))/.*winedevice' 2>/dev/null"
             ])
@@ -665,6 +703,71 @@ enum AppVersion {
         let short = info?["CFBundleShortVersionString"] as? String ?? "?"
         let build = info?["CFBundleVersion"] as? String ?? "?"
         return "v\(short)  build \(build)"
+    }
+}
+
+// MARK: - Runtime versions
+
+/// What the menu shows under the Windows row. Everything is read from files
+/// on disk, so it describes what Wine will actually load.
+enum RuntimeInfo {
+    /// "Windows 11" or "Windows 10", from the version Wine records in the prefix.
+    /// Wine keeps writing the product name "Windows 10 Pro" for Windows 11 and
+    /// only raises the build number, so the build decides (22000 and up is 11).
+    static func windowsVersion(prefix: URL) -> String {
+        guard let reg = try? String(contentsOf: prefix.appendingPathComponent("system.reg"),
+                                    encoding: .utf8) else { return "Windows" }
+        let header = "[Software\\\\Microsoft\\\\Windows NT\\\\CurrentVersion]"
+        var inSection = false
+        var build: Int?
+        var product: String?
+        for line in reg.split(separator: "\n", omittingEmptySubsequences: true) {
+            if line.hasPrefix("[") {
+                if inSection { break }
+                inSection = line.hasPrefix(header)
+            } else if inSection {
+                if let v = stringValue(line, key: "CurrentBuildNumber") { build = Int(v) }
+                else if let v = stringValue(line, key: "ProductName") { product = v }
+            }
+        }
+        if let build, build >= 22000 { return "Windows 11" }
+        // "Windows 10 Pro" -> "Windows 10"
+        if let product, product.hasPrefix("Windows ") {
+            return product.split(separator: " ").prefix(2).joined(separator: " ")
+        }
+        return "Windows"
+    }
+
+    /// `"Key"="value"` -> `value`
+    private static func stringValue(_ line: Substring, key: String) -> String? {
+        let prefix = "\"\(key)\"=\""
+        guard line.hasPrefix(prefix), line.hasSuffix("\"") else { return nil }
+        return String(line.dropFirst(prefix.count).dropLast())
+    }
+
+    /// "Wine 10.0 r8" from the engine's `version` file ("wine sikarugir 10.0 (revision 8)").
+    static func wineVersion(engine: URL) -> String {
+        guard let text = try? String(contentsOf: engine.appendingPathComponent("version"),
+                                     encoding: .utf8) else { return "Wine" }
+        let words = text.split(whereSeparator: \.isWhitespace)
+        guard words.count >= 3, words[0] == "wine" else { return "Wine" }
+        var s = "Wine \(words[2])"
+        if words.count >= 5, words[3] == "(revision" { s += " r\(words[4].dropLast())" }
+        return s
+    }
+
+    /// "4.0b3" from the overlaid D3DMetal framework.
+    static func gptkVersion(external: URL) -> String? {
+        let plist = external.appendingPathComponent(
+            "D3DMetal.framework/Versions/A/Resources/Info.plist")
+        return (NSDictionary(contentsOf: plist)?["CFBundleShortVersionString"] as? String)
+    }
+
+    /// "Wine 10.0 r8 · GPTK 4.0b3"
+    static func summary(engine: URL, external: URL) -> String {
+        var parts = [wineVersion(engine: engine)]
+        if let g = gptkVersion(external: external) { parts.append("GPTK \(g)") }
+        return parts.joined(separator: " · ")
     }
 }
 
@@ -730,6 +833,9 @@ struct SteamRow: View {
     let openFolder: () -> Void
     let folderDisabled: Bool
     let icon: AnyView
+    /// Replace the detail line with "Running" while the session is up. Off for
+    /// the Windows row, where the detail line carries the Wine and GPTK versions.
+    var showsRunningLabel = true
 
     var body: some View {
         HStack(spacing: 10) {
@@ -747,7 +853,7 @@ struct SteamRow: View {
                         Text(title)
                             .font(.system(size: 13, weight: .medium))
                             .foregroundStyle(.primary)
-                        Text(running ? "Running" : detail)
+                        Text(running && showsRunningLabel ? "Running" : detail)
                             .font(.system(size: 11))
                             .foregroundStyle(.secondary)
                     }
@@ -785,7 +891,10 @@ struct MenuView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack {
+            HStack(spacing: 6) {
+                Image(nsImage: NSApplication.shared.applicationIconImage)
+                    .resizable()
+                    .frame(width: 20, height: 20)
                 Text("Espresso")
                     .font(.headline)
                 Spacer()
@@ -795,10 +904,12 @@ struct MenuView: View {
             }
             .padding(.bottom, 8)
 
-            Text(sup.status)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .padding(.bottom, 8)
+            if !sup.status.isEmpty {
+                Text(sup.status)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.bottom, 8)
+            }
 
             SteamRow(
                 title: "Mac",
@@ -812,14 +923,15 @@ struct MenuView: View {
             )
             Divider()
             SteamRow(
-                title: "Windows",
-                detail: sup.doctorPassed ? "Wine" : "Doctor must pass",
+                title: sup.windowsVersion,
+                detail: sup.doctorPassed ? sup.runtimeVersions : "Doctor must pass",
                 running: sup.sessionAlive,
                 disabled: sup.isLaunching || !sup.doctorPassed || sup.sessionAlive,
                 action: { sup.startSteam() },
                 openFolder: { sup.openPrefix() },
                 folderDisabled: false,
-                icon: AnyView(WindowsMark().frame(width: 15, height: 15))
+                icon: AnyView(WindowsMark().frame(width: 15, height: 15)),
+                showsRunningLabel: false
             )
 
             Divider()
@@ -828,13 +940,10 @@ struct MenuView: View {
             HStack {
                 Button("Stop") { sup.stop() }
                     .disabled(sup.isLaunching || (!sup.sessionAlive && !sup.macSessionAlive))
-                Button("Doctor") { sup.runDoctor() }
-                    .keyboardShortcut("d")
-                if sup.doctorRan {
-                    Text("\(sup.checks.filter(\.ok).count)/\(sup.checks.count)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                Button(sup.doctorRan ? (sup.doctorPassed ? "Doctor ✓" : "Doctor ❌") : "Doctor") {
+                    sup.runDoctor()
                 }
+                .keyboardShortcut("d")
                 Spacer()
                 Button("Logs") { sup.openLogs() }
                 Button("Quit") {
