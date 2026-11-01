@@ -1,9 +1,8 @@
-//  Espresso — ARM-native menu-bar supervisor for one Steam prefix running
-//  under x86_64 Wine with Apple D3DMetal.
+//  Espresso — ARM-native menu-bar supervisor for a Steam library on Apple
+//  Silicon: native Mac Steam, or Windows Steam under x86_64 Wine + D3DMetal.
 //
-//  Implements design-doc 001: sections 1 (what Espresso is), 5 (layout),
-//  9 (the D3DMetal load path and doctor checks), 11 (process model) and
-//  13 (v0 scope).
+//  Games are launched from Steam (D3D11/D3D12 via GPTK). Star Wars Zero
+//  Company is a DX12 test title only, not the product scope.
 //
 //  Build: sh build.sh
 
@@ -14,7 +13,7 @@ import AppKit
 // MARK: - Layout
 
 struct Layout {
-    static let engineName = "WS12WineSikarugir10.0_6"
+    static let engineName = "WS12WineSikarugir10.0_8"
 
     let base: URL
     let engine: URL
@@ -51,13 +50,13 @@ struct Layout {
         )
     }
 
-    /// Windows-side path of the shipping exe, per 001 section 10.2.
-    static let gameWindowsPath =
+    /// DX12 test title (UE5). Informational doctor check only — Espresso is
+    /// a Steam-library supervisor, not a single-game launcher.
+    static let dx12TestWindowsPath =
         "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Star Wars Zero Company" +
         "\\SWZeroCompany\\Binaries\\Win64\\SWZeroCompany.exe"
 
-    /// POSIX path of that same exe inside the prefix, for existence checks.
-    func gamePOSIXPath() -> String {
+    func dx12TestPOSIXPath() -> String {
         prefix.path + "/drive_c/Program Files (x86)/Steam/steamapps/common/" +
         "Star Wars Zero Company/SWZeroCompany/Binaries/Win64/SWZeroCompany.exe"
     }
@@ -84,12 +83,21 @@ final class Supervisor: ObservableObject {
     @Published var doctorPassed = false
     @Published var doctorRan = false
     @Published var status = "Idle"
-    @Published var gamePresent = false
+    /// Informational: DX12 test title installed in the prefix (not product scope).
+    @Published var dx12TestPresent = false
     @Published var isLaunching = false
+    @Published var sessionAlive = false
+    @Published var macSessionAlive = false
+
+    static let macSteamBundleID = "com.valvesoftware.steam"
+    static let macSteamApp = URL(fileURLWithPath: "/Applications/Steam.app")
 
     private let fm = FileManager.default
+    private var wineJobs: [Process] = []
+    private var sessionTimer: DispatchSourceTimer?
+    private var launchWaitTicks = 0
 
-    // MARK: Environment (001 section 9, items 1-8)
+    // MARK: Environment (Wine + GPTK D3DMetal)
 
     func wineEnvironment() -> [String: String] {
         var env = ProcessInfo.processInfo.environment
@@ -131,6 +139,20 @@ final class Supervisor: ObservableObject {
         }
         env["PATH"] = path
         return env
+    }
+
+    /// Command line that runs an x86_64 Wine binary under Rosetta with the engine's
+    /// library search path intact.
+    ///
+    /// `/usr/bin/arch` is SIP-protected, so dyld strips every `DYLD_*` variable at that
+    /// exec. Newer Sikarugir engines (10.0_7+) ship no `LC_RPATH`, so their wine,
+    /// wineserver and unix `.so` files resolve libinotify, FreeType and gnutls only
+    /// through `DYLD_FALLBACK_LIBRARY_PATH`. `/usr/bin/env` re-sets it after `arch`
+    /// has run, where dyld no longer strips it.
+    func archWine(_ exe: String, _ args: [String]) -> (exe: String, args: [String]) {
+        let fallback = wineEnvironment()["DYLD_FALLBACK_LIBRARY_PATH"] ?? ""
+        return ("/usr/bin/arch",
+                ["-x86_64", "/usr/bin/env", "DYLD_FALLBACK_LIBRARY_PATH=\(fallback)", exe] + args)
     }
 
     // MARK: Shell helper
@@ -175,7 +197,7 @@ final class Supervisor: ObservableObject {
         return r.out.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    // MARK: Doctor (001 section 9)
+    // MARK: Doctor
 
     func runDoctor() {
         var out: [Check] = []
@@ -265,15 +287,16 @@ final class Supervisor: ObservableObject {
                          ok: gmpOK,
                          detail: gmpOK ? "present in engine lib/" : "missing — libgnutls will not load"))
 
-        // 8c. pdh stub — UE5 SWZeroCompany crashes 0x80000100 at 0s without it.
+        // pdh stub — UE5 crashes 0x80000100 at 0s without it (found on the DX12 test title).
         let pdh = L.prefix.appendingPathComponent("drive_c/windows/system32/pdh.dll")
         let pdhOK = fm.fileExists(atPath: pdh.path)
         out.append(Check(name: "pdh stub",
                          ok: pdhOK,
-                         detail: pdhOK ? "native stub in system32/ — UE5 will not crash on PdhOpenQuery" : "missing — SWZeroCompany will crash 0x80000100"))
+                         detail: pdhOK ? "native stub in system32/ — UE5 will not crash on PdhOpenQuery" : "missing — UE5 titles crash 0x80000100 on PdhOpenQuery"))
         if !pdhOK {
             // Also check registry override is set — otherwise builtin pdh still used.
-            let r = shellWine("/usr/bin/arch", ["-x86_64", L.wine.path, "reg", "query", "HKCU\\Software\\Wine\\DllOverrides", "/v", "pdh"])
+            let cmd = archWine(L.wine.path, ["reg", "query", "HKCU\\Software\\Wine\\DllOverrides", "/v", "pdh"])
+            let r = shellWine(cmd.exe, cmd.args)
             let hasOverride = r.out.localizedCaseInsensitiveContains("native")
             if !hasOverride {
                 out[out.count - 1] = Check(name: "pdh stub",
@@ -297,7 +320,7 @@ final class Supervisor: ObservableObject {
         }
         out.append(Check(name: "Prefix arch", ok: prefixOK, detail: prefixDetail))
 
-        // 10. wineserver must be ours, not CrossOver's (001 section 11)
+        // wineserver must be ours, not CrossOver's
         let ps = shell("/usr/bin/pgrep", ["-fl", "wineserver"])
         let foreign = ps.out.split(separator: "\n").filter {
             $0.localizedCaseInsensitiveContains("CrossOver")
@@ -307,8 +330,8 @@ final class Supervisor: ObservableObject {
                          detail: foreign.isEmpty ? "only Espresso wineserver"
                                                  : "CrossOver wineserver running"))
 
-        // 11. Game exe present (informational; does not block Steam)
-        let present = fm.fileExists(atPath: L.gamePOSIXPath())
+        // DX12 test title present (informational; does not block Steam)
+        let present = fm.fileExists(atPath: L.dx12TestPOSIXPath())
         let passed = out.allSatisfy { $0.ok }
         let okCount = out.filter { $0.ok }.count
 
@@ -316,23 +339,86 @@ final class Supervisor: ObservableObject {
         checks = out
         doctorPassed = passed
         doctorRan = true
-        gamePresent = present
+        dx12TestPresent = present
         status = passed ? "Doctor passed (\(okCount)/\(out.count))"
                         : "Doctor FAILED (\(okCount)/\(out.count))"
     }
 
     // MARK: Launch
 
-    private func launchWine(_ args: [String], label: String) {
+    /// True when *this* prefix has a live Wine session. Do not use a bare
+    /// `pgrep -f steam.exe` — wow64 Steam often has no steam.exe in argv,
+    /// and the wine wrapper may still be running before wineserver shows up.
+    /// Wine-spawned wineserver often has argv0 "wineserver" with no full path,
+    /// so path-matching `pgrep -lf` misses it.
+    func prefixSessionAlive() -> Bool {
+        if wineJobs.contains(where: { $0.isRunning }) { return true }
+        return winePrefixBusy()
+    }
+
+    /// Wine* processes (wine, wine64, wineserver, wine-preloader) holding our prefix.
+    private func winePrefixBusy() -> Bool {
+        let r = shell("/usr/sbin/lsof", ["-c", "wine", "-Fn"])
+        return r.status == 0 && r.out.contains(layout.prefix.path)
+    }
+
+    private func hideSteamHostDylib() -> URL? {
+        if let u = Bundle.main.url(forResource: "hide-steam-host", withExtension: "dylib"),
+           fm.fileExists(atPath: u.path) {
+            return u
+        }
+        let helper = layout.base.appendingPathComponent("Helpers/hide-steam-host.dylib")
+        return fm.fileExists(atPath: helper.path) ? helper : nil
+    }
+
+    func steamLogCount() -> Int {
+        (try? fm.contentsOfDirectory(atPath: layout.logs.path))?
+            .filter { $0.hasPrefix("steam-") && $0.hasSuffix(".log") }.count ?? 0
+    }
+
+    func startSessionWatch() {
+        guard sessionTimer == nil else { return }
+        let t = DispatchSource.makeTimerSource(queue: .main)
+        t.schedule(deadline: .now() + 0.5, repeating: 1.0)
+        t.setEventHandler { [weak self] in
+            self?.refreshSession()
+        }
+        t.resume()
+        sessionTimer = t
+    }
+
+    func refreshSession() {
+        let alive = prefixSessionAlive()
+        sessionAlive = alive
+        if alive {
+            launchWaitTicks = 0
+            if isLaunching {
+                isLaunching = false
+            }
+        } else if isLaunching && !macSteamRunning() {
+            launchWaitTicks += 1
+            if launchWaitTicks >= 30 {
+                isLaunching = false
+                status = "Steam failed to start (no wineserver)"
+            }
+        }
+        macSessionAlive = macSteamRunning()
+        if macSessionAlive && isLaunching {
+            isLaunching = false
+        }
+    }
+
+    @discardableResult
+    private func launchWine(_ args: [String], label: String) -> Bool {
         guard fm.fileExists(atPath: layout.wine.path) else {
             DispatchQueue.main.async { self.status = "No Wine binary" }
-            return
+            return false
         }
         do {
             try fm.createDirectory(at: layout.logs, withIntermediateDirectories: true)
         } catch {
             DispatchQueue.main.async { self.status = "Cannot create log dir: \(error)" }
-            return
+            return false
         }
 
         let stamp = ISO8601DateFormatter().string(from: Date())
@@ -342,13 +428,20 @@ final class Supervisor: ObservableObject {
         fm.createFile(atPath: logURL.path, contents: nil)
         guard let handle = FileHandle(forWritingAtPath: logURL.path) else {
             DispatchQueue.main.async { self.status = "Cannot open log file" }
-            return
+            return false
         }
 
         let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/arch")
-        p.arguments = ["-x86_64", layout.wine.path] + args
-        p.environment = wineEnvironment()
+        let cmd = archWine(layout.wine.path, args)
+        p.executableURL = URL(fileURLWithPath: cmd.exe)
+        p.arguments = cmd.args
+        var env = wineEnvironment()
+        // steam.exe is a Wine GUI process with no real window; steamwebhelper
+        // owns the Library. Without this, Cmd+Tab shows two "Wine" tiles.
+        if label == "Steam", let dylib = hideSteamHostDylib() {
+            env["DYLD_INSERT_LIBRARIES"] = dylib.path
+        }
+        p.environment = env
         p.currentDirectoryURL = layout.engine
 
         let pipe = Pipe()
@@ -365,23 +458,37 @@ final class Supervisor: ObservableObject {
             try? handle.close()
             let code = proc.terminationStatus
             DispatchQueue.main.async {
-                self?.status = "\(label) exited with \(code)"
-                self?.isLaunching = false
+                guard let self else { return }
+                self.wineJobs.removeAll { $0 === proc }
+                let alive = self.prefixSessionAlive()
+                self.sessionAlive = alive
+                if alive {
+                    // Wine wrapper exited; Steam continues under wineserver.
+                    self.isLaunching = false
+                    self.status = "\(label) running"
+                } else {
+                    self.isLaunching = false
+                    self.status = "\(label) exited with \(code)"
+                }
             }
         }
 
         do {
             try p.run()
+            wineJobs.append(p)
             DispatchQueue.main.async {
                 self.status = "\(label) running, pid \(p.processIdentifier)"
             }
+            return true
         } catch {
             fh.readabilityHandler = nil
             try? handle.close()
             DispatchQueue.main.async {
                 self.status = "Failed to start \(label): \(error.localizedDescription)"
                 self.isLaunching = false
+                self.sessionAlive = self.prefixSessionAlive()
             }
+            return false
         }
     }
 
@@ -389,38 +496,107 @@ final class Supervisor: ObservableObject {
         shell("/usr/bin/pgrep", ["-f", name]).status == 0
     }
 
-    func startSteam() {
-        if isLaunching || isRunning("steam.exe") {
-            DispatchQueue.main.async { self.status = "Steam already running" }
-            return
-        }
-        isLaunching = true
-        if isRunning("wineserver") && !isRunning("steam.exe") {
-            // Stale wineserver from previous session — kill before fresh launch
-            stopSync()
-        }
-        // 001 section 10.1: -no-cef-sandbox. Never -cef-force-32bit, it is gone.
-        launchWine(["C:\\Program Files (x86)\\Steam\\steam.exe", "-no-cef-sandbox"],
-                   label: "Steam")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { self.isLaunching = false }
+    func macSteamInstalled() -> Bool {
+        fm.fileExists(atPath: Self.macSteamApp.path)
     }
 
-    func startGame() {
-        if isLaunching || isRunning(Layout.gameWindowsPath) || isRunning("SWZeroCompany.exe") {
-            DispatchQueue.main.async { self.status = "Game already running" }
+    func macSteamRunning() -> Bool {
+        !NSRunningApplication.runningApplications(withBundleIdentifier: Self.macSteamBundleID).isEmpty
+    }
+
+    func stopMacSteamSync() {
+        let apps = NSRunningApplication.runningApplications(withBundleIdentifier: Self.macSteamBundleID)
+        apps.forEach { $0.terminate() }
+        for _ in 0..<25 {
+            if !macSteamRunning() { break }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        if macSteamRunning() {
+            NSRunningApplication.runningApplications(withBundleIdentifier: Self.macSteamBundleID)
+                .forEach { $0.forceTerminate() }
+            Thread.sleep(forTimeInterval: 0.3)
+        }
+    }
+
+    func startMacSteam() {
+        if isLaunching || macSteamRunning() {
+            DispatchQueue.main.async {
+                self.macSessionAlive = true
+                self.status = "Mac Steam already running"
+            }
+            return
+        }
+        guard macSteamInstalled() else {
+            DispatchQueue.main.async { self.status = "No Steam.app in /Applications" }
             return
         }
         isLaunching = true
-        // 001 section 10.2: launch the shipping exe, not the Unreal bootstrapper.
-        launchWine([Layout.gameWindowsPath], label: "ZeroCompany")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { self.isLaunching = false }
+        launchWaitTicks = 0
+        startSessionWatch()
+        if prefixSessionAlive() {
+            status = "Stopping Windows Steam…"
+            stopSync()
+        }
+        let cfg = NSWorkspace.OpenConfiguration()
+        cfg.activates = true
+        NSWorkspace.shared.openApplication(at: Self.macSteamApp, configuration: cfg) { [weak self] _, err in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.isLaunching = false
+                self.macSessionAlive = self.macSteamRunning()
+                if let err {
+                    self.status = "Failed to start Mac Steam: \(err.localizedDescription)"
+                } else {
+                    self.status = "Mac Steam running"
+                }
+            }
+        }
+    }
+
+    func startSteam() {
+        if isLaunching || prefixSessionAlive() {
+            DispatchQueue.main.async {
+                self.sessionAlive = true
+                self.status = "Windows Steam already running"
+            }
+            return
+        }
+        isLaunching = true
+        launchWaitTicks = 0
+        startSessionWatch()
+        if macSteamRunning() {
+            status = "Stopping Mac Steam…"
+            stopMacSteamSync()
+            macSessionAlive = false
+        }
+        // Steam: -no-cef-sandbox. Never -cef-force-32bit (removed from current Steam).
+        if launchWine(["C:\\Program Files (x86)\\Steam\\steam.exe", "-no-cef-sandbox"],
+                      label: "Steam") {
+            sessionAlive = true
+        } else {
+            isLaunching = false
+            sessionAlive = prefixSessionAlive()
+        }
+    }
+
+    /// Launch the DX12 test title (shipping exe, not the Unreal bootstrapper).
+    func startDx12TestTitle() {
+        if isLaunching || isRunning(Layout.dx12TestWindowsPath) || isRunning("SWZeroCompany.exe") {
+            DispatchQueue.main.async { self.status = "DX12 test title already running" }
+            return
+        }
+        isLaunching = true
+        if !launchWine([Layout.dx12TestWindowsPath], label: "dx12-test") {
+            isLaunching = false
+        }
     }
 
     /// Synchronous stop for use on quit; do not dispatch to main.
     func stopSync() {
         let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/arch")
-        p.arguments = ["-x86_64", layout.wineserver.path, "-k"]
+        let cmd = archWine(layout.wineserver.path, ["-k"])
+        p.executableURL = URL(fileURLWithPath: cmd.exe)
+        p.arguments = cmd.args
         p.environment = wineEnvironment()
         try? p.run()
         p.waitUntilExit()
@@ -428,20 +604,34 @@ final class Supervisor: ObservableObject {
         // lsof +D on the prefix is the authority — pkill -f is broad, so filter by lsof first.
         let holders = shell("/usr/sbin/lsof", ["+D", layout.prefix.path]).out
         let hasHolders = holders.contains("wineserver") || holders.contains("steam") || holders.contains("winedevice")
-        if hasHolders || shell("/usr/bin/pgrep", ["-f", layout.wineserver.path]).status == 0 {
+        if hasHolders || winePrefixBusy() {
             _ = shell("/bin/sh", ["-c",
                 "lsof +D '\(layout.prefix.path)' 2>/dev/null | awk 'NR>1{print $2}' | xargs -I {} kill -9 {} 2>/dev/null; " +
                 "pkill -9 -f '\(NSRegularExpression.escapedPattern(for: layout.wineserver.path))' 2>/dev/null; " +
                 "pkill -9 -f '\(NSRegularExpression.escapedPattern(for: layout.prefix.path))/.*winedevice' 2>/dev/null"
             ])
         }
-        Thread.sleep(forTimeInterval: 0.3)
+        for job in wineJobs {
+            if job.isRunning {
+                job.terminate()
+                job.waitUntilExit()
+            }
+        }
+        wineJobs.removeAll()
+        for _ in 0..<30 {
+            if !winePrefixBusy() { break }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
     }
 
     func stop() {
+        stopMacSteamSync()
         stopSync()
         DispatchQueue.main.async {
-            self.status = "Stopped wineserver"
+            self.isLaunching = false
+            self.sessionAlive = self.prefixSessionAlive()
+            self.macSessionAlive = self.macSteamRunning()
+            self.status = "Stopped Steam"
         }
     }
 
@@ -449,9 +639,142 @@ final class Supervisor: ObservableObject {
         NSWorkspace.shared.open(layout.prefix)
     }
 
+    func openMacSteamFolder() {
+        let url = fm.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Steam")
+        if fm.fileExists(atPath: url.path) {
+            NSWorkspace.shared.open(url)
+        } else if macSteamInstalled() {
+            NSWorkspace.shared.open(Self.macSteamApp.deletingLastPathComponent())
+        } else {
+            DispatchQueue.main.async { self.status = "No Mac Steam folder" }
+        }
+    }
+
     func openLogs() {
         try? fm.createDirectory(at: layout.logs, withIntermediateDirectories: true)
         NSWorkspace.shared.open(layout.logs)
+    }
+}
+
+// MARK: - Version
+
+enum AppVersion {
+    static var line: String {
+        let info = Bundle.main.infoDictionary
+        let short = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        return "v\(short)  build \(build)"
+    }
+}
+
+// MARK: - Marks
+
+struct WindowsMark: View {
+    var body: some View {
+        GeometryReader { geo in
+            let s = min(geo.size.width, geo.size.height)
+            let gap = max(1, s * 0.12)
+            let cell = (s - gap) / 2
+            VStack(spacing: gap) {
+                HStack(spacing: gap) {
+                    Rectangle().fill(Color.primary)
+                    Rectangle().fill(Color.primary)
+                }
+                HStack(spacing: gap) {
+                    Rectangle().fill(Color.primary)
+                    Rectangle().fill(Color.primary)
+                }
+            }
+            .frame(width: cell * 2 + gap, height: cell * 2 + gap)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .aspectRatio(1, contentMode: .fit)
+        .accessibilityLabel("Windows")
+    }
+}
+
+struct SteamMark: View {
+    var body: some View {
+        Canvas { context, size in
+            let s = min(size.width, size.height)
+            let o = CGPoint(x: (size.width - s) / 2, y: (size.height - s) / 2)
+            func pt(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
+                CGPoint(x: o.x + s * x, y: o.y + s * y)
+            }
+            func oval(_ x: CGFloat, _ y: CGFloat, _ d: CGFloat) -> Path {
+                Path(ellipseIn: CGRect(x: o.x + s * x, y: o.y + s * y, width: s * d, height: s * d))
+            }
+
+            context.stroke(oval(0.06, 0.06, 0.88), with: .color(.primary), lineWidth: max(1, s * 0.09))
+
+            var arm = Path()
+            arm.move(to: pt(0.34, 0.66))
+            arm.addLine(to: pt(0.66, 0.36))
+            context.stroke(arm, with: .color(.primary),
+                           style: StrokeStyle(lineWidth: max(1.2, s * 0.11), lineCap: .round))
+
+            context.fill(oval(0.20, 0.52, 0.30), with: .color(.primary))
+            context.stroke(oval(0.54, 0.24, 0.26), with: .color(.primary), lineWidth: max(1, s * 0.08))
+        }
+        .accessibilityLabel("Steam")
+    }
+}
+
+struct SteamRow: View {
+    let title: String
+    let detail: String
+    let running: Bool
+    let disabled: Bool
+    let action: () -> Void
+    let openFolder: () -> Void
+    let folderDisabled: Bool
+    let icon: AnyView
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Button(action: action) {
+                HStack(spacing: 8) {
+                    HStack(spacing: 5) {
+                        icon
+                            .frame(width: 16, height: 16)
+                        SteamMark()
+                            .frame(width: 16, height: 16)
+                    }
+                    .foregroundStyle(.primary)
+
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(title)
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(.primary)
+                        Text(running ? "Running" : detail)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 8)
+                    if running {
+                        Image(systemName: "checkmark")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(disabled)
+
+            Button(action: openFolder) {
+                Image(systemName: "folder")
+                    .font(.system(size: 13))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 28, height: 28)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(folderDisabled)
+            .help("Open folder")
+        }
+        .padding(.vertical, 6)
     }
 }
 
@@ -461,53 +784,84 @@ struct MenuView: View {
     @ObservedObject var sup = Supervisor.shared
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("Espresso")
+                    .font(.headline)
+                Spacer()
+                Text(AppVersion.line)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.bottom, 8)
+
             Text(sup.status)
-                .font(.system(size: 11))
+                .font(.caption)
                 .foregroundStyle(.secondary)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 4)
+                .padding(.bottom, 8)
+
+            SteamRow(
+                title: "Mac",
+                detail: sup.macSteamInstalled() ? "Native Steam" : "Steam.app not installed",
+                running: sup.macSessionAlive,
+                disabled: sup.isLaunching || !sup.macSteamInstalled() || sup.macSessionAlive,
+                action: { sup.startMacSteam() },
+                openFolder: { sup.openMacSteamFolder() },
+                folderDisabled: false,
+                icon: AnyView(Image(systemName: "apple.logo").font(.system(size: 15)))
+            )
+            Divider()
+            SteamRow(
+                title: "Windows",
+                detail: sup.doctorPassed ? "Wine" : "Doctor must pass",
+                running: sup.sessionAlive,
+                disabled: sup.isLaunching || !sup.doctorPassed || sup.sessionAlive,
+                action: { sup.startSteam() },
+                openFolder: { sup.openPrefix() },
+                folderDisabled: false,
+                icon: AnyView(WindowsMark().frame(width: 15, height: 15))
+            )
 
             Divider()
+                .padding(.vertical, 8)
 
-            Button("Run doctor") { sup.runDoctor() }
-                .keyboardShortcut("d")
-
-            if sup.doctorRan {
-                Menu("Doctor results (\(sup.checks.filter(\.ok).count)/\(sup.checks.count))") {
-                    ForEach(sup.checks) { c in
-                        Label("\(c.name) — \(c.detail)",
-                              systemImage: c.ok ? "checkmark.circle.fill" : "xmark.octagon.fill")
-                    }
+            HStack {
+                Button("Stop") { sup.stop() }
+                    .disabled(sup.isLaunching || (!sup.sessionAlive && !sup.macSessionAlive))
+                Button("Doctor") { sup.runDoctor() }
+                    .keyboardShortcut("d")
+                if sup.doctorRan {
+                    Text("\(sup.checks.filter(\.ok).count)/\(sup.checks.count)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Logs") { sup.openLogs() }
+                Button("Quit") {
+                    sup.stopSync()
+                    NSApplication.shared.terminate(nil)
                 }
             }
+            .controlSize(.small)
 
-            Divider()
-
-            Button("Start Steam") { sup.startSteam() }
-                .disabled(!sup.doctorPassed || sup.isLaunching)
-
-            if !sup.doctorPassed {
-                Text("Doctor must pass before launch")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 12)
-            }
-
-            Button("Stop Steam") { sup.stop() }
-
-            Divider()
-
-            Button("Open Steam Folder") { sup.openPrefix() }
-            Button("Open logs") { sup.openLogs() }
-
-            Divider()
-
-            Button("Quit Espresso") {
-                sup.stopSync()
-                NSApplication.shared.terminate(nil)
+            if sup.doctorRan && !sup.doctorPassed {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(sup.checks.filter { !$0.ok }) { c in
+                            Text("\(c.name) — \(c.detail)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 64)
+                .padding(.top, 8)
             }
         }
+        .padding(12)
+        .frame(width: 280)
+        .onAppear { sup.refreshSession() }
     }
 }
 
@@ -530,7 +884,81 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             exit(sup.doctorPassed ? 0 : 1)
         }
 
+        if CommandLine.arguments.contains("--self-test") {
+            exit(Self.runSteamLaunchSelfTest(sup) ? 0 : 1)
+        }
+
         sup.runDoctor()
+        sup.startSessionWatch()
+        sup.refreshSession()
+    }
+
+    /// Start Steam, refuse a second start, stop. Repeat. Catches the double-launch
+    /// path where a second wine steam.exe is spawned into a live prefix.
+    private static func runSteamLaunchSelfTest(_ sup: Supervisor) -> Bool {
+        print("Espresso self-test — Steam start/stop, no double launch")
+        sup.runDoctor()
+        guard sup.doctorPassed else {
+            print("FAIL doctor did not pass")
+            return false
+        }
+
+        func wait(_ seconds: TimeInterval, until pred: () -> Bool) -> Bool {
+            let deadline = Date().addingTimeInterval(seconds)
+            while Date() < deadline {
+                if pred() { return true }
+                RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.2))
+            }
+            return pred()
+        }
+
+        let cycles = 3
+        for i in 1...cycles {
+            print("cycle \(i)/\(cycles): stop")
+            sup.stopSync()
+            sup.isLaunching = false
+            sup.sessionAlive = false
+            guard wait(5, until: { !sup.prefixSessionAlive() }) else {
+                print("FAIL cycle \(i): wineserver still alive after stop")
+                return false
+            }
+
+            let logsBefore = sup.steamLogCount()
+            print("cycle \(i)/\(cycles): start")
+            sup.startSteam()
+            guard wait(20, until: { sup.prefixSessionAlive() }) else {
+                print("FAIL cycle \(i): wineserver did not start (\(sup.status))")
+                sup.stopSync()
+                return false
+            }
+
+            print("cycle \(i)/\(cycles): second start must no-op")
+            sup.startSteam()
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(2))
+            let logsAfter = sup.steamLogCount()
+            let spawned = logsAfter - logsBefore
+            if spawned != 1 {
+                print("FAIL cycle \(i): expected 1 steam log, got \(spawned) (before=\(logsBefore) after=\(logsAfter))")
+                sup.stopSync()
+                return false
+            }
+            if !sup.prefixSessionAlive() {
+                print("FAIL cycle \(i): session died after second start")
+                return false
+            }
+
+            print("cycle \(i)/\(cycles): stop")
+            sup.stopSync()
+            sup.isLaunching = false
+            sup.sessionAlive = false
+            guard wait(5, until: { !sup.prefixSessionAlive() }) else {
+                print("FAIL cycle \(i): wineserver still alive after final stop")
+                return false
+            }
+            print("cycle \(i)/\(cycles): PASS")
+        }
+        print("RESULT: PASS")
+        return true
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -550,6 +978,6 @@ struct EspressoApp: App {
             Image(systemName: supervisor.doctorPassed
                   ? "cup.and.saucer.fill" : "cup.and.saucer")
         }
-        .menuBarExtraStyle(.menu)
+        .menuBarExtraStyle(.window)
     }
 }

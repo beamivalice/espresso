@@ -15,9 +15,37 @@ swiftc -O -swift-version 5 -parse-as-library \
        -target arm64-apple-macosx13.0 \
        main.swift -o "$BIN"
 
+echo "== hide-steam-host dylib (x86_64, injected into Wine) =="
+clang -dynamiclib -O2 -arch x86_64 -mmacosx-version-min=13.0 \
+      hide-steam-host.m -o build/hide-steam-host.dylib \
+      -framework AppKit -framework Foundation
+mkdir -p "$HOME/Library/Application Support/Espresso/Helpers"
+cp build/hide-steam-host.dylib "$HOME/Library/Application Support/Espresso/Helpers/"
+
+echo "== app icon =="
+swiftc -O -target arm64-apple-macosx13.0 \
+       make-icon.swift -o build/make-icon
+./build/make-icon build/icon-1024.png
+ICONSET=build/AppIcon.iconset
+rm -rf "$ICONSET"
+mkdir -p "$ICONSET"
+sips -z 16 16     build/icon-1024.png --out "$ICONSET/icon_16x16.png" >/dev/null
+sips -z 32 32     build/icon-1024.png --out "$ICONSET/icon_16x16@2x.png" >/dev/null
+sips -z 32 32     build/icon-1024.png --out "$ICONSET/icon_32x32.png" >/dev/null
+sips -z 64 64     build/icon-1024.png --out "$ICONSET/icon_32x32@2x.png" >/dev/null
+sips -z 128 128   build/icon-1024.png --out "$ICONSET/icon_128x128.png" >/dev/null
+sips -z 256 256   build/icon-1024.png --out "$ICONSET/icon_128x128@2x.png" >/dev/null
+sips -z 256 256   build/icon-1024.png --out "$ICONSET/icon_256x256.png" >/dev/null
+sips -z 512 512   build/icon-1024.png --out "$ICONSET/icon_256x256@2x.png" >/dev/null
+sips -z 512 512   build/icon-1024.png --out "$ICONSET/icon_512x512.png" >/dev/null
+sips -z 1024 1024 build/icon-1024.png --out "$ICONSET/icon_512x512@2x.png" >/dev/null
+iconutil -c icns "$ICONSET" -o build/AppIcon.icns
+
 echo "== bundling =="
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/$NAME"
+cp build/hide-steam-host.dylib "$APP/Contents/Resources/"
+cp build/AppIcon.icns "$APP/Contents/Resources/"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -29,8 +57,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleIdentifier</key><string>dev.espresso.supervisor</string>
     <key>CFBundleExecutable</key><string>Espresso</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.1.0</string>
-    <key>CFBundleVersion</key><string>1</string>
+    <key>CFBundleShortVersionString</key><string>0.3</string>
+    <key>CFBundleVersion</key><string>10</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>LSUIElement</key><true/>
     <key>NSHighResolutionCapable</key><true/>
