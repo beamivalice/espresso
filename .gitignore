@@ -17,3 +17,5 @@ Steam/
 
 # docs
 design-doc/
+# Apple GPTK downloads (not redistributable)
+*.dmg
