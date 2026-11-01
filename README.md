@@ -22,6 +22,10 @@ Runtime lives under `~/Library/Application Support/Espresso/`:
 | `Steam/` | Wine prefix (Windows Steam + library) |
 | `Logs/` | Launch logs |
 
+## Install
+
+Espresso supervises a runtime that you assemble yourself (Rosetta, the Wine engine, x86_64 libraries, the GPTK overlay, a prefix with Windows Steam). Follow **[install-guide.md](install-guide.md)** from a clean Mac to a passing `--doctor` and a running Windows Steam.
+
 ## Build
 
 ```sh
