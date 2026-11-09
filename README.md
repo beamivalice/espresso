@@ -9,8 +9,6 @@ It supervises two Steam clients and keeps only one running at a time:
 
 Launch games from Steam as usual. DirectX 9 and Vulkan are outside this GPTK path.
 
-**Star Wars Zero Company** is a DX12 test title used to prove the D3DMetal load path. It is not the product.
-
 ## Layout
 
 Runtime lives under `~/Library/Application Support/Espresso/`:
