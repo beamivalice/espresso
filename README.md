@@ -1,6 +1,6 @@
 # Espresso
 
-Espresso is a menu-bar app for running **my Steam library** on Apple Silicon — the Windows titles in the library, not a single game.
+Espresso is a menu-bar app for running Steam library on Apple Silicon — the Windows titles in the library.
 
 It supervises two Steam clients and keeps only one running at a time:
 
